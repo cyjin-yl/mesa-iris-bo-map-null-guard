@@ -1,0 +1,416 @@
+--- a/src/gallium/drivers/iris/iris_batch.c	2026-10-01 22:39:53.000000000 +0800
++++ b/src/gallium/drivers/iris/iris_batch.c	2026-10-22 21:43:27.528349503 +0800
+@@ -129,10 +129,14 @@
+          if (bo->real.mmap_mode == IRIS_MMAP_NONE)
+             return (struct intel_batch_decode_bo) { };
+ 
++         void *map = iris_bo_map(batch->dbg, bo, MAP_READ | MAP_ASYNC);
++         if (!map)
++            return (struct intel_batch_decode_bo) { };
++
+          return (struct intel_batch_decode_bo) {
+             .addr = bo_address,
+             .size = bo->size,
+-            .map = iris_bo_map(batch->dbg, bo, MAP_READ | MAP_ASYNC),
++            .map = map,
+          };
+       }
+    }
+@@ -159,8 +163,9 @@
+ iris_batch_decode_batch(struct iris_batch *batch)
+ {
+    void *map = iris_bo_map(batch->dbg, batch->exec_bos[0], MAP_READ);
+-   intel_print_batch(&batch->decoder, map, batch->primary_batch_size,
+-                     batch->exec_bos[0]->address, false);
++   if (map)
++      intel_print_batch(&batch->decoder, map, batch->primary_batch_size,
++                        batch->exec_bos[0]->address, false);
+ }
+ 
+ static void
+@@ -411,15 +416,33 @@
+    struct iris_bufmgr *bufmgr = screen->bufmgr;
+ 
+    /* TODO: We probably could suballocate batches... */
+-   batch->bo = iris_bo_alloc(bufmgr, "command buffer",
+-                             BATCH_SZ + BATCH_RESERVED, 8,
+-                             IRIS_MEMZONE_OTHER,
+-                             BO_ALLOC_NO_SUBALLOC | BO_ALLOC_CAPTURE);
+-   batch->map = iris_bo_map(NULL, batch->bo, MAP_READ | MAP_WRITE);
+-   batch->map_next = batch->map;
++   /* Allocate and map the new command buffer before dropping the old one.
++    * If iris_bo_map() fails (gem_mmap can fail when the BAR aperture is
++    * exhausted) we must keep the old, still-usable BO rather than leaving
++    * the batch empty or pointing at a NULL mapping.
++    */
++   struct iris_bo *bo = iris_bo_alloc(bufmgr, "command buffer",
++                                      BATCH_SZ + BATCH_RESERVED, 8,
++                                      IRIS_MEMZONE_OTHER,
++                                      BO_ALLOC_NO_SUBALLOC | BO_ALLOC_CAPTURE);
++   void *map = bo ? iris_bo_map(NULL, bo, MAP_READ | MAP_WRITE) : NULL;
++   if (!map) {
++      perf_debug(NULL, "create_batch: failed to map command buffer, keeping "
++                "the old batch\n");
++      iris_bo_unreference(bo);
++      return;
++   }
++
++   /* No longer held by the batch; still referenced by the validation list.
++    * The batch may already have been reset with a NULL bo. */
++   if (batch->bo)
++      iris_bo_unreference(batch->bo);
++   batch->bo = bo;
++   batch->map = map;
++   batch->map_next = map;
+ 
+    ensure_exec_obj_space(batch, 1);
+-   add_bo_to_batch(batch, batch->bo, false);
++   add_bo_to_batch(batch, bo, false);
+ }
+ 
+ static void
+@@ -450,6 +473,7 @@
+    u_trace_fini(&batch->trace);
+ 
+    iris_bo_unreference(batch->bo);
++   batch->bo = NULL;
+    batch->primary_batch_size = 0;
+    batch->total_chained_batch_size = 0;
+    batch->contains_draw = false;
+@@ -460,7 +484,7 @@
+       batch->decoder.bt_pool_base = batch->last_binder_address;
+ 
+    create_batch(batch);
+-   assert(batch->bo->index == 0);
++   assert(!batch->bo || batch->bo->index == 0);
+ 
+    memset(batch->bos_written, 0,
+           sizeof(BITSET_WORD) * BITSET_WORDS(batch->exec_array_size));
+@@ -587,13 +611,15 @@
+ 
+    record_batch_sizes(batch);
+ 
+-   /* No longer held by batch->bo, still held by validation list */
++   /* No longer held by batch->bo, still held by validation list. */
+    iris_bo_unreference(batch->bo);
++   batch->bo = NULL;
+    create_batch(batch);
+ 
+    /* Emit MI_BATCH_BUFFER_START to chain to another batch. */
+    *cmd = (0x31 << 23) | (1 << 8) | (3 - 2);
+-   *addr = batch->bo->address;
++   if (batch->bo)
++      *addr = batch->bo->address;
+ }
+ 
+ static void
+@@ -967,6 +993,18 @@
+    /* Start a new batch buffer. */
+    iris_batch_reset(batch);
+ 
++   /* If the new batch could not be created (gem_mmap failure), report a
++    * submission failure and let the established error path take over,
++    * instead of writing commands into a NULL mapping.
++    */
++   if (!batch->bo) {
++#if MESA_DEBUG
++      fprintf(stderr, "iris: failed to create a new batch buffer after "
++              "reset (gem_mmap failure)\n");
++#endif
++      abort();
++   }
++
+    /* Check if context or engine was banned, if yes try to replace it
+     * with a new logical context, and inform iris_context that all state
+     * has been lost and needs to be re-initialized.  If this succeeds,
+--- a/src/gallium/drivers/iris/iris_binder.c	2026-10-01 22:39:53.000000000 +0800
++++ b/src/gallium/drivers/iris/iris_binder.c	2026-10-22 21:39:28.926630074 +0800
+@@ -47,12 +47,24 @@
+    struct iris_bufmgr *bufmgr = screen->bufmgr;
+    struct iris_binder *binder = &ice->state.binder;
+ 
+-   if (binder->bo)
+-      iris_bo_unreference(binder->bo);
++   struct iris_bo *old_bo = binder->bo;
++   struct iris_bo *bo = iris_bo_alloc(bufmgr, "binder", binder->size,
++                                      binder->alignment,
++                                      IRIS_MEMZONE_BINDER, BO_ALLOC_PLAIN);
++   void *map = bo ? iris_bo_map(NULL, bo, MAP_WRITE) : NULL;
++
++   if (!map) {
++      /* gem_mmap failed (e.g. BAR space exhaustion).  Keep the old binder;
++       * the next reservation retries with a fresh allocation.
++       */
++      iris_bo_unreference(bo);
++      return;
++   }
+ 
+-   binder->bo = iris_bo_alloc(bufmgr, "binder", binder->size, binder->alignment,
+-                              IRIS_MEMZONE_BINDER, BO_ALLOC_PLAIN);
+-   binder->map = iris_bo_map(NULL, binder->bo, MAP_WRITE);
++   /* Only drop the old binder once the replacement is fully usable. */
++   binder->bo = bo;
++   binder->map = map;
++   iris_bo_unreference(old_bo);
+ 
+    /* Avoid using offset 0 - tools consider it NULL. */
+    binder->insert_point = binder->alignment;
+--- a/src/gallium/drivers/iris/iris_border_color.c	2026-10-01 22:39:53.000000000 +0800
++++ b/src/gallium/drivers/iris/iris_border_color.c	2026-10-22 21:40:24.137573270 +0800
+@@ -58,7 +58,14 @@
+    pool->bo = iris_bo_alloc(bufmgr, "border colors",
+                             IRIS_BORDER_COLOR_POOL_SIZE, 64,
+                             IRIS_MEMZONE_BORDER_COLOR_POOL, BO_ALLOC_PLAIN);
+-   pool->map = iris_bo_map(NULL, pool->bo, MAP_WRITE);
++   pool->map = pool->bo ? iris_bo_map(NULL, pool->bo, MAP_WRITE) : NULL;
++   if (!pool->map) {
++      /* gem_mmap failed (e.g. BAR space exhaustion).  Leave the pool empty;
++       * iris_upload_border_color() falls back to black in that case. */
++      iris_bo_unreference(pool->bo);
++      pool->bo = NULL;
++      return;
++   }
+ 
+    /* Don't make 0 a valid offset - tools treat that as a NULL pointer. */
+    pool->insert_point = BC_ALIGNMENT;
+@@ -89,6 +96,13 @@
+    uint32_t offset;
+    uint32_t hash = color_hash(color);
+ 
++   if (!pool->bo) {
++      /* Border color pool unusable (gem_mmap failure); fall back to black,
++       * matching the pool-full behavior below. */
++      offset = BC_BLACK;
++      goto out;
++   }
++
+    simple_mtx_lock(&pool->lock);
+ 
+    struct hash_entry *entry =
+--- a/src/gallium/drivers/iris/iris_bufmgr.c	2026-10-01 22:39:53.000000000 +0800
++++ b/src/gallium/drivers/iris/iris_bufmgr.c	2026-10-22 21:38:45.277303207 +0800
+@@ -1764,7 +1764,10 @@
+    if (bo->gem_handle == 0) {
+       struct iris_bo *real = iris_get_backing_bo(bo);
+       uint64_t offset = bo->address - real->address;
+-      map = iris_bo_map(dbg, real, flags | MAP_ASYNC) + offset;
++      void *real_map = iris_bo_map(dbg, real, flags | MAP_ASYNC);
++      if (!real_map)
++         return NULL;
++      map = real_map + offset;
+    } else {
+       assert(bo->real.mmap_mode != IRIS_MMAP_NONE);
+       if (bo->real.mmap_mode == IRIS_MMAP_NONE)
+@@ -2334,6 +2337,8 @@
+    buf->gpu = bo->address;
+    buf->gpu_end = buf->gpu + bo->size;
+    buf->map = iris_bo_map(NULL, bo, MAP_WRITE | MAP_RAW);
++   if (!buf->map)
++      goto err_free;
+    return buf;
+ 
+ err_vm_alloc:
+--- a/src/gallium/drivers/iris/iris_measure.c	2026-10-01 22:39:53.000000000 +0800
++++ b/src/gallium/drivers/iris/iris_measure.c	2026-10-22 21:40:34.156107340 +0800
+@@ -100,7 +100,17 @@
+    measure->bo = iris_bo_alloc(bufmgr, "measure",
+                                config->batch_size * sizeof(uint64_t), 8,
+                                IRIS_MEMZONE_OTHER, BO_ALLOC_ZEROED);
+-   measure->base.timestamps = iris_bo_map(NULL, measure->bo, MAP_READ);
++   measure->base.timestamps =
++      measure->bo ? iris_bo_map(NULL, measure->bo, MAP_READ) : NULL;
++   if (!measure->base.timestamps) {
++      /* gem_mmap failed (e.g. BAR space exhaustion); drop the measurement
++       * buffer and disable batch measurement for this context. */
++      iris_bo_unreference(measure->bo);
++      measure->bo = NULL;
++      free(batch->measure);
++      batch->measure = NULL;
++      return;
++   }
+    measure->base.renderpass =
+       (uintptr_t)util_hash_crc32(&ice->state.framebuffer,
+                                  sizeof(ice->state.framebuffer));
+@@ -111,8 +121,10 @@
+ {
+    if (!batch)
+       return;
+-   iris_bo_unmap(batch->bo);
+-   iris_bo_unreference(batch->bo);
++   if (batch->bo) {
++      iris_bo_unmap(batch->bo);
++      iris_bo_unreference(batch->bo);
++   }
+    batch->bo = NULL;
+    free(batch);
+ }
+@@ -130,6 +142,8 @@
+                        const char *event_name,
+                        uint32_t count)
+ {
++   if (!batch->measure)
++      return;
+    struct intel_measure_batch *measure_batch = &batch->measure->base;
+    const struct intel_measure_config *config = config_from_context(ice);
+    const struct iris_screen *screen = (void *) ice->ctx.screen;
+@@ -203,6 +217,8 @@
+ measure_end_snapshot(struct iris_batch *batch,
+                      uint32_t event_count)
+ {
++   if (!batch->measure)
++      return;
+    struct intel_measure_batch *measure_batch = &batch->measure->base;
+    const struct intel_measure_config *config = config_from_context(batch->ice);
+ 
+--- a/src/gallium/drivers/iris/iris_resource.c	2026-10-01 22:39:53.000000000 +0800
++++ b/src/gallium/drivers/iris/iris_resource.c	2026-10-22 20:45:49.135390120 +0800
+@@ -2274,8 +2274,18 @@
+       iris_batch_flush(map->batch);
+ 
+    assert(((struct iris_resource *)map->staging)->offset == 0);
+-   map->ptr =
+-      iris_bo_map(map->dbg, staging_bo, xfer->usage & MAP_FLAGS) + extra;
++   void *staging_map =
++      iris_bo_map(map->dbg, staging_bo, xfer->usage & MAP_FLAGS);
++   if (!staging_map) {
++      /* gem_mmap can fail (e.g. BAR space exhaustion).  Destroy the staging
++       * resource and let the caller fall back to mapping directly on the
++       * CPU, as if staging creation itself had failed.
++       */
++      iris_resource_destroy(pscreen, map->staging);
++      map->staging = NULL;
++      return;
++   }
++   map->ptr = staging_map + extra;
+ 
+    map->unmap = iris_unmap_copy_region;
+ }
+@@ -2331,18 +2341,28 @@
+    const bool has_swizzling = false;
+ 
+    if (xfer->usage & PIPE_MAP_WRITE) {
+-      char *dst = res->offset +
++      void *bo_map =
+          iris_bo_map(map->dbg, res->bo, (xfer->usage | MAP_RAW) & MAP_FLAGS);
++      if (!bo_map) {
++         /* gem_mmap failed (e.g. BAR space exhaustion).  Dropping the update
++          * is preferable to dereferencing a NULL mapping.
++          */
++         perf_debug(map->dbg,
++                    "iris_unmap_tiled_memcpy: failed to map backing buffer, "
++                    "tiled update dropped\n");
++      } else {
++         char *dst = res->offset + bo_map;
+ 
+-      for (int s = 0; s < box->depth; s++) {
+-         unsigned x1, x2, y1, y2;
+-         tile_extents(surf, box, xfer->level, s, &x1, &x2, &y1, &y2);
++         for (int s = 0; s < box->depth; s++) {
++            unsigned x1, x2, y1, y2;
++            tile_extents(surf, box, xfer->level, s, &x1, &x2, &y1, &y2);
+ 
+-         void *ptr = map->ptr + s * xfer->layer_stride;
++            void *ptr = map->ptr + s * xfer->layer_stride;
+ 
+-         isl_memcpy_linear_to_tiled(x1, x2, y1, y2, dst, ptr,
+-                                    surf->row_pitch_B, xfer->stride,
+-                                    has_swizzling, surf->tiling, ISL_MEMCPY);
++            isl_memcpy_linear_to_tiled(x1, x2, y1, y2, dst, ptr,
++                                       surf->row_pitch_B, xfer->stride,
++                                       has_swizzling, surf->tiling, ISL_MEMCPY);
++         }
+       }
+    }
+    os_free_aligned(map->buffer);
+@@ -2375,24 +2395,35 @@
+    const bool has_swizzling = false;
+ 
+    if (xfer->usage & PIPE_MAP_READ) {
+-      char *src = res->offset +
++      void *bo_map =
+          iris_bo_map(map->dbg, res->bo, (xfer->usage | MAP_RAW) & MAP_FLAGS);
++      if (!bo_map) {
++         /* gem_mmap failed (e.g. BAR space exhaustion).  Return zeros rather
++          * than reading from a NULL mapping.
++          */
++         perf_debug(map->dbg,
++                    "iris_map_tiled_memcpy: failed to map backing buffer, "
++                    "reading zeros\n");
++         memset(map->buffer, 0, xfer->layer_stride * box->depth);
++      } else {
++         char *src = res->offset + bo_map;
+ 
+-      for (int s = 0; s < box->depth; s++) {
+-         unsigned x1, x2, y1, y2;
+-         tile_extents(surf, box, xfer->level, s, &x1, &x2, &y1, &y2);
++         for (int s = 0; s < box->depth; s++) {
++            unsigned x1, x2, y1, y2;
++            tile_extents(surf, box, xfer->level, s, &x1, &x2, &y1, &y2);
+ 
+-         /* Use 's' rather than 'box->z' to rebase the first slice to 0. */
+-         void *ptr = map->ptr + s * xfer->layer_stride;
++            /* Use 's' rather than 'box->z' to rebase the first slice to 0. */
++            void *ptr = map->ptr + s * xfer->layer_stride;
+ 
+-         isl_memcpy_tiled_to_linear(x1, x2, y1, y2, ptr, src, xfer->stride,
+-                                    surf->row_pitch_B, has_swizzling,
+-                                    surf->tiling,
++            isl_memcpy_tiled_to_linear(x1, x2, y1, y2, ptr, src, xfer->stride,
++                                       surf->row_pitch_B, has_swizzling,
++                                       surf->tiling,
+ #if defined(USE_SSE41)
+-                                    util_get_cpu_caps()->has_sse4_1 ?
+-                                    ISL_MEMCPY_STREAMING_LOAD :
++                                       util_get_cpu_caps()->has_sse4_1 ?
++                                       ISL_MEMCPY_STREAMING_LOAD :
+ #endif
+-                                    ISL_MEMCPY);
++                                       ISL_MEMCPY);
++         }
+       }
+    }
+ 
+@@ -2406,8 +2437,15 @@
+    struct pipe_box *box = &xfer->box;
+    struct iris_resource *res = (struct iris_resource *) xfer->resource;
+ 
+-   void *ptr = res->offset +
+-      iris_bo_map(map->dbg, res->bo, xfer->usage & MAP_FLAGS);
++   void *bo_map = iris_bo_map(map->dbg, res->bo, xfer->usage & MAP_FLAGS);
++   if (!bo_map) {
++      /* Leave map->ptr NULL; iris_transfer_map will return the failure to
++       * its caller, which is documented to handle a NULL mapping.
++       */
++      perf_debug(map->dbg, "iris_map_direct: failed to map backing buffer\n");
++      return;
++   }
++   void *ptr = res->offset + bo_map;
+ 
+    if (res->base.b.target == PIPE_BUFFER) {
+       xfer->stride = 0;
+@@ -2758,6 +2796,9 @@
+    }
+ 
+    uint8_t *dst = iris_bo_map(&ice->dbg, res->bo, MAP_WRITE | MAP_RAW);
++   if (!dst)
++      return u_default_texture_subdata(ctx, resource, level, usage, box,
++                                       data, stride, layer_stride);
+ 
+    for (int s = 0; s < box->depth; s++) {
+       const uint8_t *src = data + s * layer_stride;
+--- a/src/gallium/drivers/iris/iris_utrace.c	2026-10-01 22:39:53.000000000 +0800
++++ b/src/gallium/drivers/iris/iris_utrace.c	2026-10-22 21:41:21.568634817 +0800
+@@ -68,7 +68,12 @@
+                     IRIS_MEMZONE_OTHER,
+                     BO_ALLOC_SMEM);
+ 
+-   void *ptr = iris_bo_map(NULL, bo, MAP_READ | MAP_WRITE);
++   void *ptr = bo ? iris_bo_map(NULL, bo, MAP_READ | MAP_WRITE) : NULL;
++   if (!ptr) {
++      /* gem_mmap failed (e.g. BAR space exhaustion); tracing is best-effort. */
++      iris_bo_unreference(bo);
++      return NULL;
++   }
+    memset(ptr, 0, size_B);
+ 
+    return bo;

@@ -1,0 +1,160 @@
+{
+  "audit": "iris_bo_map() NULL-return call sites (gem_mmap failure, e.g. BAR/CPU-window exhaustion)",
+  "baseline": "mesa 26.2.4 (Fedora 44 build, matches doesworkstation VM100)",
+  "method": "grep every iris_bo_map( call site in src/gallium/drivers/iris/; each checked for a NULL check on the return value; the same call site then checked on upstream main (raw git files) to confirm the bug is still present upstream.",
+  "upstream_main_status": "ALL sites below are STILL unguarded on upstream main (verified against raw main files before cleanup).",
+  "sites": [
+    {
+      "file": "src/gallium/drivers/iris/iris_resource.c",
+      "function": "iris_map_copy_region",
+      "line": 2277,
+      "risk": "staging BO map NULL -> map->ptr unset, later deref",
+      "fix": "on NULL: destroy staging, map->staging=NULL, return (caller falls back to direct CPU map)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_resource.c",
+      "function": "iris_unmap_tiled_memcpy",
+      "line": 2334,
+      "risk": "WRITE-side tiled memcpy: dst = res->offset + NULL -> SEGV in isl_memcpy_linear_to_tiled / linear_to_tile4_faster (THE FIELD CRASH in gnome-shell tc_flush)",
+      "fix": "on NULL: perf_debug 'tiled update dropped', skip the copy"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_resource.c",
+      "function": "iris_map_tiled_memcpy",
+      "line": 2378,
+      "risk": "READ-side tiled memcpy: src = res->offset + NULL -> SEGV in isl_memcpy_tiled_to_linear",
+      "fix": "on NULL: perf_debug, memset map->buffer to zeros"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_resource.c",
+      "function": "iris_map_direct",
+      "line": 2409,
+      "risk": "direct map NULL -> map->ptr left NULL, caller derefs",
+      "fix": "on NULL: perf_debug, leave map->ptr NULL (documented NULL-return contract of pipe texture_transfer)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_resource.c",
+      "function": "iris_texture_subdata",
+      "line": 2761,
+      "risk": "linear upload dst map NULL -> SEGV in the per-slice memcpy loop",
+      "fix": "on NULL: fall back to u_default_texture_subdata"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_bufmgr.c",
+      "function": "iris_bo_map",
+      "line": 1767,
+      "risk": "alias (gem_handle==0) path: real_map NULL -> map = NULL + offset -> SEGV",
+      "fix": "on NULL: return NULL"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_bufmgr.c",
+      "function": "intel_aux_map_buffer_alloc",
+      "line": 2334,
+      "risk": "aux map BO map NULL -> buf->map NULL, later deref",
+      "fix": "on NULL: goto err_free (caller handles NULL return)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_batch.c",
+      "function": "iris_batch_decode_bo (debug)",
+      "line": 132,
+      "risk": "debug decode map NULL -> decoder derefs",
+      "fix": "on NULL: return empty decode-BO struct"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_batch.c",
+      "function": "iris_batch_decode_batch (debug)",
+      "line": 165,
+      "risk": "debug batch map NULL -> intel_print_batch derefs",
+      "fix": "if (map) intel_print_batch(...)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_batch.c",
+      "function": "create_batch",
+      "line": 416,
+      "risk": "command-buffer map NULL -> batch->map NULL, every command write SEGVs",
+      "fix": "REWORKED to swap pattern: alloc+map the NEW bo before unref'ing the old; on NULL keep the old (still-usable) batch"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_batch.c",
+      "function": "iris_batch_reset",
+      "line": 473,
+      "risk": "after unref, batch->bo dangling; create_batch swap would double-unref",
+      "fix": "batch->bo=NULL after unref; assert(!batch->bo || batch->bo->index==0)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_batch.c",
+      "function": "iris_batch_flush (via _iris_batch_flush)",
+      "line": 993,
+      "risk": "post-reset empty batch -> command writes into NULL map",
+      "fix": "if (!batch->bo) { perf message; abort(); } (void function, matches the driver's established submission-failure contract)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_batch.c",
+      "function": "iris_chain_to_new_batch",
+      "line": 611,
+      "risk": "post-unref dangling batch->bo; create_batch double-unref; *addr = batch->bo->address NULL deref",
+      "fix": "batch->bo=NULL after unref; if (batch->bo) *addr = batch->bo->address;"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_binder.c",
+      "function": "binder_realloc",
+      "line": 47,
+      "risk": "unrefs old binder bo BEFORE allocating the replacement; on map failure the binder is left with no bo/map",
+      "fix": "save old_bo, alloc+map the new bo first; on NULL keep the old binder; only swap on success"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_border_color.c",
+      "function": "iris_init_border_color_pool",
+      "line": 58,
+      "risk": "pool map NULL -> pool->map NULL, every upload derefs",
+      "fix": "on NULL: unref bo, pool->bo=NULL, return (pool left empty)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_border_color.c",
+      "function": "iris_upload_border_color",
+      "line": 96,
+      "risk": "upload on empty pool derefs pool->bo/pool->map",
+      "fix": "if (!pool->bo) fall back to BC_BLACK (matches the pool-full path)"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_measure.c",
+      "function": "iris_init_batch_measure",
+      "line": 100,
+      "risk": "measure BO map NULL -> base.timestamps NULL, snapshot derefs",
+      "fix": "on NULL: unref bo, free measure, batch->measure=NULL"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_measure.c",
+      "function": "iris_destroy_batch_measure",
+      "line": 111,
+      "risk": "unmap/unref of a NULL bo (after the init-failure path)",
+      "fix": "if (batch->bo) { unmap; unref; }"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_measure.c",
+      "function": "measure_start_snapshot",
+      "line": 130,
+      "risk": "batch->measure NULL after init failure -> deref",
+      "fix": "if (!batch->measure) return;"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_measure.c",
+      "function": "measure_end_snapshot",
+      "line": 203,
+      "risk": "batch->measure NULL after init failure -> deref",
+      "fix": "if (!batch->measure) return;"
+    },
+    {
+      "file": "src/gallium/drivers/iris/iris_utrace.c",
+      "function": "iris_utrace_create_buffer",
+      "line": 68,
+      "risk": "utrace BO map NULL -> memset(NULL) SEGV",
+      "fix": "on NULL: unref bo, return NULL (u_trace framework handles a NULL buffer; the emit path already checks)"
+    }
+  ],
+  "notes": [
+    "iris_utrace_emit_timestamp already had a NULL guard on its map result (line ~130); only create_buffer needed the fix.",
+    "The field crash (gnome-shell tc_flush) is the iris_unmap_tiled_memcpy site — the write-side linear_to_tile4 path.",
+    "All 22 hunks compile (ninja on the real tree) and the patch dry-runs cleanly against the pristine 26.2.4 source."
+  ]
+}
